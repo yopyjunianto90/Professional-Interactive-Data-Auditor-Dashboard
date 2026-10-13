@@ -1,0 +1,263 @@
+import io
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, HTML, clear_output
+from google.colab import files as colab_files
+
+# Global variable to store the loaded dataframe
+df = None
+
+# UI Elements for File Upload
+uploader = widgets.FileUpload(
+    accept='.csv,.xlsx',
+    multiple=False,
+    description='Upload Data',
+    button_style='primary',
+    icon='upload'
+)
+
+output_panel = widgets.Output()
+
+def clean_data(dataframe):
+    """Membersihkan data duplikat dan mengisi missing values secara otomatis"""
+    cleaned_df = dataframe.copy()
+
+    # 1. Hapus duplikasi
+    cleaned_df = cleaned_df.drop_duplicates()
+
+    # 2. Isi missing values
+    for col in cleaned_df.columns:
+        if cleaned_df[col].isnull().any():
+            if pd.api.types.is_numeric_dtype(cleaned_df[col]):
+                # Isi dengan mean untuk kolom numerik
+                cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].mean())
+            else:
+                # Isi dengan mode (nilai terbanyak) untuk kategorikal/objek
+                if not cleaned_df[col].mode().empty:
+                    cleaned_df[col] = cleaned_df[col].fillna(cleaned_df[col].mode()[0])
+                else:
+                    cleaned_df[col] = cleaned_df[col].fillna("Unknown")
+
+    return cleaned_df
+
+def run_data_audit(dataframe):
+    """Melakukan audit kualitas data dan mengembalikan laporan HTML serta status isu"""
+    total_rows = len(dataframe)
+    total_cols = len(dataframe.columns)
+    missing_info = dataframe.isnull().sum()
+    duplicate_rows = dataframe.duplicated().sum()
+
+    audit_html = "<div style='font-family: Arial, sans-serif; padding: 15px; border-radius: 8px; background-color: #f8f9fa;'>"
+    audit_html += "<h3 style='color: #2c3e50; margin-top:0;'>⚠️ Laporan Audit Kualitas Data</h3>"
+    audit_html += f"<p><b>Total Baris:</b> {total_rows} | <b>Total Kolom:</b> {total_cols}</p>"
+
+    has_issues = False
+
+    # 1. Check Missing Values
+    missing_cols = missing_info[missing_info > 0]
+    if not missing_cols.empty:
+        has_issues = True
+        audit_html += "<div style='padding: 10px; margin-bottom: 10px; background-color: #fff3cd; border-left: 5px solid #ffc107; border-radius: 4px;'>"
+        audit_html += "<strong style='color: #856404;'>Peringatan Data Kosong (Missing Values):</strong><br>"
+        for col, count in missing_cols.items():
+            pct = (count / total_rows) * 100
+            audit_html += f"- Kolom <code>{col}</code> memiliki {count} data kosong ({pct:.2f}%)<br>"
+        audit_html += "</div>"
+
+    # 2. Check Duplicates
+    if duplicate_rows > 0:
+        has_issues = True
+        pct_dup = (duplicate_rows / total_rows) * 100
+        audit_html += f"<div style='padding: 10px; margin-bottom: 10px; background-color: #f8d7da; border-left: 5px solid #dc3545; border-radius: 4px;'>"
+        audit_html += f"<strong style='color: #721c24;'>Peringatan Duplikasi Data:</strong><br>"
+        audit_html += f"Ditemukan {duplicate_rows} baris duplikat ({pct_dup:.2f}% dari total data). Disarankan untuk menghapus duplikasi ini."
+        audit_html += "</div>"
+
+    # 3. Check Anomalies in Numeric Columns (Outliers using IQR)
+    numeric_cols = dataframe.select_dtypes(include=[np.number]).columns
+    outlier_list = []
+    for col in numeric_cols:
+        Q1 = dataframe[col].quantile(0.25)
+        Q3 = dataframe[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        outliers = dataframe[(dataframe[col] < lower_bound) | (dataframe[col] > upper_bound)]
+        if len(outliers) > 0:
+            outlier_list.append((col, len(outliers)))
+
+    if outlier_list:
+        has_issues = True
+        audit_html += "<div style='padding: 10px; margin-bottom: 10px; background-color: #e2e3e5; border-left: 5px solid #6c757d; border-radius: 4px;'>"
+        audit_html += "<strong style='color: #383d41;'>Peringatan Pencilan (Outliers Detected):</strong><br>"
+        for col, count in outlier_list:
+            audit_html += f"- Kolom <code>{col}</code> mendeteksi {count} data yang berada di luar batas wajar (potensi anomali).<br>"
+        audit_html += "</div>"
+
+    if not has_issues:
+        audit_html += "<div style='padding: 10px; background-color: #d4edda; border-left: 5px solid #28a745; border-radius: 4px; color: #155724;'>"
+        audit_html += "<b>Kondisi Data Bersih!</b> Tidak ditemukan data kosong, duplikat, atau anomali yang signifikan. Data siap dianalisis."
+        audit_html += "</div>"
+
+    audit_html += "</div>"
+    return audit_html, has_issues
+
+def create_dashboard(dataframe):
+    """Membuat kontrol interaktif dan visualisasi dinamis"""
+    all_cols = list(dataframe.columns)
+    numeric_cols = list(dataframe.select_dtypes(include=[np.number]).columns)
+    categorical_cols = list(dataframe.select_dtypes(exclude=[np.number]).columns)
+
+    if not categorical_cols:
+        categorical_cols = all_cols
+    if not numeric_cols:
+        numeric_cols = all_cols
+
+    chart_type = widgets.Dropdown(options=['Bar Chart', 'Line Chart', 'Scatter Plot', 'Box Plot', 'Pie Chart'], description='Jenis Chart:', style={'description_width': 'initial'})
+    x_axis = widgets.Dropdown(options=all_cols, value=categorical_cols[0], description='Sumbu X:', style={'description_width': 'initial'})
+    y_axis = widgets.Dropdown(options=numeric_cols, value=numeric_cols[0] if numeric_cols else all_cols[0], description='Sumbu Y:', style={'description_width': 'initial'})
+    color_by = widgets.Dropdown(options=['None'] + categorical_cols, value='None', description='Warna/Grup:', style={'description_width': 'initial'})
+
+    plot_output = widgets.Output()
+    current_fig = [None]
+
+    def update_chart(*args):
+        with plot_output:
+            clear_output(wait=True)
+            try:
+                color_param = None if color_by.value == 'None' else color_by.value
+                title = f"{chart_type.value} Analysis: {y_axis.value} vs {x_axis.value}"
+
+                theme_layout = dict(
+                    template='plotly_white',
+                    title_font=dict(size=18, family="Arial", color="#2c3e50"),
+                    margin=dict(l=40, r=40, t=60, b=40)
+                )
+
+                if chart_type.value == 'Bar Chart':
+                    agg_df = dataframe.groupby(x_axis.value)[y_axis.value].mean().reset_index() if color_param is None else \
+                             dataframe.groupby([x_axis.value, color_param])[y_axis.value].mean().reset_index()
+                    fig = px.bar(agg_df, x=x_axis.value, y=y_axis.value, color=color_param, title=title, barmode='group')
+
+                elif chart_type.value == 'Line Chart':
+                    agg_df = dataframe.groupby(x_axis.value)[y_axis.value].mean().reset_index() if color_param is None else \
+                             dataframe.groupby([x_axis.value, color_param])[y_axis.value].mean().reset_index()
+                    fig = px.line(agg_df, x=x_axis.value, y=y_axis.value, color=color_param, title=title, markers=True)
+
+                elif chart_type.value == 'Scatter Plot':
+                    fig = px.scatter(dataframe, x=x_axis.value, y=y_axis.value, color=color_param, title=title)
+
+                elif chart_type.value == 'Box Plot':
+                    fig = px.box(dataframe, x=x_axis.value, y=y_axis.value, color=color_param, title=title)
+
+                elif chart_type.value == 'Pie Chart':
+                    agg_df = dataframe.groupby(x_axis.value)[y_axis.value].sum().reset_index()
+                    fig = px.pie(agg_df, names=x_axis.value, values=y_axis.value, title=f"Kontribusi {y_axis.value} berdasarkan {x_axis.value}", hole=0.4)
+
+                fig.update_layout(**theme_layout)
+                current_fig[0] = fig
+                fig.show()
+            except Exception as e:
+                print(f"Gagal memuat visualisasi: Sumbu tidak kompatibel.\nDetail: {str(e)}")
+
+    chart_type.observe(update_chart, 'value')
+    x_axis.observe(update_chart, 'value')
+    y_axis.observe(update_chart, 'value')
+    color_by.observe(update_chart, 'value')
+
+    update_chart()
+
+    export_btn = widgets.Button(
+        description='💾 Ekspor Dashboard ke HTML',
+        button_style='success',
+        style={'font_weight': 'bold'},
+        icon='download'
+    )
+
+    def on_export_clicked(b):
+        if current_fig[0] is not None:
+            file_path = "dashboard_analyst.html"
+            current_fig[0].write_html(file_path)
+            colab_files.download(file_path)
+
+    export_btn.on_click(on_export_clicked)
+
+    controls = widgets.VBox([
+        widgets.HTML("<h4 style='color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 5px; margin-bottom: 15px;'>⚙️ Dashboard Control Panel</h4>"),
+        widgets.HBox([chart_type, x_axis]),
+        widgets.HBox([y_axis, color_by]),
+        widgets.HTML("<div style='margin-bottom: 10px;'></div>"),
+        export_btn
+    ])
+
+    display(widgets.VBox([controls, plot_output]))
+
+def render_workflow(dataframe):
+    """Me-render workflow penuh audit dan dashboard dari data terpilih"""
+    # Preview Data
+    display(HTML("<h4>📋 Cuplikan Data (Top 5 Rows)</h4>"))
+    display(dataframe.head())
+
+    # Run Audit
+    audit_report, has_issues = run_data_audit(dataframe)
+    display(HTML(audit_report))
+
+    if has_issues:
+        # Sediakan tombol pembersihan instan jika terdeteksi masalah
+        clean_btn = widgets.Button(
+            description='🧹 Bersihkan Data Otomatis',
+            button_style='warning',
+            style={'font_weight': 'bold'}
+        )
+
+        def on_clean_clicked(b):
+            global df
+            with output_panel:
+                clear_output(wait=True)
+                print("🧹 Sedang membersihkan data secara otomatis...")
+                df = clean_data(df)
+                display(HTML("<div style='color: green; font-weight: bold;'>✓ Data berhasil dibersihkan dari duplikat & nilai kosong!</div>"))
+                render_workflow(df)
+
+        clean_btn.on_click(on_clean_clicked)
+        display(clean_btn)
+
+    # Dashboard Visualisasi selalu ditampilkan langsung
+    dashboard_title = "📈 INTERACTIVE ANALYST DASHBOARD (CLEAN DATA)" if not has_issues else "📈 INTERACTIVE ANALYST DASHBOARD (RAW DATA)"
+    display(HTML(f"<br><h3 style='color: #2980b9;'>{dashboard_title}</h3>"))
+    create_dashboard(dataframe)
+
+def on_file_upload(change):
+    global df
+    with output_panel:
+        clear_output()
+        if not uploader.value:
+            return
+
+        uploaded_file = list(uploader.value.values())[0]
+        file_name = uploaded_file['metadata']['name']
+        content = uploaded_file['content']
+
+        print(f"⏳ Memuat berkas: {file_name}...")
+
+        try:
+            if file_name.endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(content))
+            elif file_name.endswith('.xlsx'):
+                df = pd.read_excel(io.BytesIO(content))
+
+            display(HTML(f"<div style='color: green; font-weight: bold;'>✓ Berhasil memuat {file_name}!</div>"))
+            render_workflow(df)
+
+        except Exception as e:
+            display(HTML(f"<div style='color: red; font-weight: bold;'>⚠️ Gagal membaca berkas: {str(e)}</div>"))
+
+uploader.observe(on_file_upload, names='value')
+
+# Display the primary upload widget
+display(HTML("<h2 style='color: #2c3e50; font-family: Arial;'>💼 Analyst Dashboard Platform</h2>"))
+display(uploader)
+display(output_panel)
